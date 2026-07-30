@@ -1,0 +1,13 @@
+# --- Fins de ligne : LF partout (repo + working tree) ---
+# Le projet tourne sur Linux (Docker, bash start.sh/enrich.sh, EC2). On force LF pour
+# tuer le bruit de diff quand OneDrive/Windows reconvertit les fichiers en CRLF :
+# git normalise en LF au commit ET à la comparaison -> plus de "fichier entier modifié".
+* text=auto eol=lf
+
+# --- Fichiers binaires : jamais de conversion EOL, suivis en Git-LFS ---
+*.sqlite3 filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.jpg filter=lfs diff=lfs merge=lfs -text
+*.jpeg filter=lfs diff=lfs merge=lfs -text
+*.png filter=lfs diff=lfs merge=lfs -text
+*.db filter=lfs diff=lfs merge=lfs -text

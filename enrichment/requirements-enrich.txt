@@ -1,0 +1,12 @@
+requests
+opencv-python
+albumentations
+Pillow
+numpy
+chromadb
+ftfy
+regex
+tqdm
+# torch (CPU) et CLIP s'installent séparément (voir docs/enrichment.md) :
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   pip install git+https://github.com/openai/CLIP.git --no-deps

@@ -1,0 +1,35 @@
+# Git & Python
+.git/
+.gitignore
+.gitattributes
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Secrets & config
+.env
+.env.example
+
+# Code d'enrichissement (tourne en local, pas dans l'image) : gardé au repo pour
+# reproductibilité, inutile au runtime du Space.
+enrichment/
+ingest_pdfs.py
+
+# Docs & méta (inutiles au runtime de l'image)
+docs/
+README.md
+CHANGELOG.md
+LICENSE
+Dockerfile
+.dockerignore
+Lancement des terminaux.txt
+pdfs/
+
+# Données -> tirées de S3 au boot par start.sh, jamais bakées dans l'image
+# (sinon l'image embarque une base figée, alors que le Space doit consommer
+#  la base enrichie en local puis poussée sur S3).
+harvard_clean.db
+images_clean/
+images_augmented/
+vector_store_images/
+vector_store_text/

@@ -1,0 +1,18 @@
+# Secrets — ne JAMAIS committer
+.env
+.env.*
+!.env.example
+
+# Données -> vivent dans S3, jamais dans git
+harvard_clean.db
+images_clean/
+images_augmented/
+vector_store_images/
+vector_store_text/
+pdfs/
+
+# Python / OS / notes locales
+__pycache__/
+*.pyc
+.DS_Store
+Lancement des terminaux.txt

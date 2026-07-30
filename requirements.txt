@@ -1,0 +1,27 @@
+requests
+albumentations
+opencv-python-headless
+torch==2.6.0            # aligné sur l'image de base Docker (pytorch/pytorch:2.6.0) : déjà satisfait au build, pas de réinstall
+torchvision
+Pillow
+pillow-heif
+numpy
+git+https://github.com/openai/CLIP.git
+transformers==5.14.1
+huggingface_hub
+chromadb==1.5.9         # doit matcher la version qui a écrit vector_store_* (format de persistance lu depuis S3)
+streamlit==1.60.0
+streamlit-image-coordinates
+pypdf
+langchain
+langchain-core==1.5.1
+langchain-text-splitters
+langchain-ollama
+# Providers LLM alternatifs (guide_core lit LLM_PROVIDER) : hors runtime Ollama par défaut, gardés pour flexibilité
+langchain-openai
+langchain-anthropic
+langgraph
+ollama
+fastapi
+uvicorn[standard]
+mcp
