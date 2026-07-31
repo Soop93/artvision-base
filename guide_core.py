@@ -40,12 +40,14 @@ Termine TOUJOURS par une seule question courte, simple et concrète : ce que le 
 ressent, remarque, ou a envie d'explorer."""
 
 
-#Connexion ChromaDB PDF, mise en cache : rouvrir un PersistentClient à chaque question est inutile
-#et ajoute une latence disque évitable une fois qu'on vise des réponses rapides sur T4.
 _DOCS_COLLECTION = None
 
 
 def _get_docs_collection():
+    """Ouvre la collection Chroma des PDF (embeddings de texte) une seule fois et la
+    réutilise. Rouvrir un PersistentClient à chaque question ajouterait une latence
+    disque inutile, qu'on veut éviter pour des réponses rapides sur T4.
+    """
     global _DOCS_COLLECTION
     if _DOCS_COLLECTION is None:
         client = chromadb.PersistentClient(path=VECTOR_STORE_PATH)
@@ -53,8 +55,17 @@ def _get_docs_collection():
     return _DOCS_COLLECTION
 
 
-#Recherche dans les embeddings des PDFS
 def retrieve_context(query: str, n_results: int = TOP_K) -> str:
+    """Récupère les passages de PDF les plus proches de `query` (le contexte RAG).
+
+    Embedde la requête avec nomic-embed-text (via Ollama), interroge la collection
+    Chroma des PDF, et renvoie les n_results passages concaténés, chacun préfixé de sa
+    source et de sa page. Renvoie une chaîne vide si la collection est absente (le
+    guide répond alors sur ses seules connaissances générales).
+
+    Le modèle d'embedding doit être le même qu'à l'ingestion des PDF (nomic-embed-text)
+    pour que les distances aient un sens : c'est le contrat d'embedding côté texte.
+    """
     try:
         collection = _get_docs_collection()
     except Exception:
@@ -83,13 +94,18 @@ def retrieve_context(query: str, n_results: int = TOP_K) -> str:
     return "\n\n---\n\n".join(passages)
 
 
-#Instance mise en cache : sur le T4 on veut amortir l'init du client à la 1ère requête puis
-#ne plus payer ce coût. keep_alive="60m" garde en plus le modèle chargé en VRAM côté serveur
-#Ollama entre deux questions du visiteur (le rechargement d'un 7B est la vraie latence à éviter).
 _CHAT_MODEL_INSTANCE = None
 
 
 def _get_chat_model():
+    """Charge le modèle de chat LangChain une seule fois et le réutilise.
+
+    Sélectionne le fournisseur selon LLM_PROVIDER (ollama par défaut, openai ou
+    anthropic possibles). Amortit l'init du client à la 1ère requête ; en mode ollama,
+    keep_alive="60m" garde en plus le modèle chargé en VRAM entre deux questions, car
+    recharger un 7B est la vraie source de latence. Lève ValueError si le fournisseur
+    est inconnu.
+    """
     global _CHAT_MODEL_INSTANCE
     if _CHAT_MODEL_INSTANCE is not None:
         return _CHAT_MODEL_INSTANCE
@@ -119,8 +135,8 @@ def _get_chat_model():
 _ROLE_TO_MESSAGE = {"system": SystemMessage, "user": HumanMessage, "assistant": AIMessage}
 
 
-#Appel générique au LLM via LangChain, quel que soit le fournisseur configuré
 def _call_llm(messages: list) -> str:
+    """Appelle le LLM avec une liste de messages et renvoie le texte de la réponse."""
     lc_messages = [_ROLE_TO_MESSAGE[m["role"]](content=m["content"]) for m in messages]
     response = _get_chat_model().invoke(lc_messages)
     return response.content
@@ -134,9 +150,19 @@ class GuideState(TypedDict):
     reply: str
 
 
-#La requête d'embedding envoyée à Chroma est enrichie du contexte de l'œuvre (titre/artiste/
-#période), même pour les questions de suivi. 
 def _node_retrieve(state: GuideState) -> GuideState:
+    """Nœud LangGraph : construit la requête RAG et range le contexte dans state["context"].
+
+    La requête d'embedding est enrichie du contexte de l'œuvre (titre, artiste, période),
+    même pour les questions de suivi. But : désambiguïser la question (un « il », un « ce
+    tableau » n'a aucun sens pour une recherche par embedding sans ce contexte). En
+    introduction (question vide), la requête se réduit à ce contexte.
+
+    Récupération en meilleur effort : Chroma renvoie toujours les passages les plus
+    proches, mais si le corpus de PDF ne couvre pas cet artiste ils seront peu pertinents.
+    Ce n'est pas bloquant : la génération se rabat alors sur les connaissances générales du
+    modèle (autorisé par le SYSTEM_PROMPT). Aucun couplage dur artiste ↔ RAG.
+    """
     artwork_metadata = state["artwork_metadata"]
     artwork_context = f"{artwork_metadata.get('title', '')} {artwork_metadata.get('artist', '')} " \
                        f"{artwork_metadata.get('period', '') or ''}".strip()
@@ -149,6 +175,17 @@ def _node_retrieve(state: GuideState) -> GuideState:
 
 
 def _node_generate(state: GuideState) -> GuideState:
+    """Nœud LangGraph : compose le prompt final et génère la réponse du guide.
+
+    Met à plat toutes les métadonnées disponibles de l'œuvre en texte, puis assemble
+    les messages selon deux cas :
+      - question posée : SYSTEM_PROMPT + métadonnées + extraits RAG + historique de
+        chat + la question, suivis d'une consigne de format (réponse développée finie
+        par une question sur le ressenti du visiteur) ;
+      - introduction (question vide) : SYSTEM_PROMPT + métadonnées, avec une consigne
+        de présenter l'œuvre de façon vivante.
+    Appelle le LLM (_call_llm) et range le texte dans state["reply"].
+    """
     artwork_metadata = state["artwork_metadata"]
     context = state["context"]
 
@@ -217,8 +254,14 @@ _graph.add_edge("generate", END)
 _guide_graph = _graph.compile()
 
 
-#Génèration de l'introduction de l'œuvre identifiée
 def generate_intro(artwork_metadata: dict) -> str:
+    """Génère le texte d'introduction du guide pour l'œuvre identifiée.
+
+    Invoque le graphe RAG avec une question vide : le nœud retrieve cherche les
+    passages liés à l'œuvre, le nœud generate rédige la présentation. Faute de
+    question, la génération s'appuie sur le SYSTEM_PROMPT (persona du guide) et la
+    consigne de la branche introduction. Renvoie le texte.
+    """
     result = _guide_graph.invoke({
         "artwork_metadata": artwork_metadata,
         "question": "",
@@ -229,8 +272,15 @@ def generate_intro(artwork_metadata: dict) -> str:
     return result["reply"]
 
 
-#Répond à une question du visiteur, en s'appuyant sur le RAG + l'historique de la conversation
 def answer_question(question: str, artwork_metadata: dict, chat_history: list) -> str:
+    """Répond à une question du visiteur sur l'œuvre.
+
+    C'est la fonction appelée à chaque question posée au guide. Elle cherche d'abord,
+    dans les PDF d'histoire de l'art, les passages qui parlent de cette œuvre et de la
+    question, puis demande au modèle de langage de rédiger une réponse à partir de ces
+    passages, des informations de l'œuvre et de l'historique de la conversation.
+    Renvoie le texte de la réponse.
+    """
     result = _guide_graph.invoke({
         "artwork_metadata": artwork_metadata,
         "question": question,

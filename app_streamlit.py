@@ -1,3 +1,16 @@
+"""Front Streamlit de l'application : point d'entrée utilisateur.
+
+Interface web où l'utilisateur prend ou importe la photo d'un tableau pour
+l'identifier dans la collection, puis peut interroger un guide conversationnel sur
+l'œuvre reconnue. Ce fichier ne contient aucune logique de vision ni de recherche :
+il gère l'affichage et les interactions, et délègue tout le calcul à l'API FastAPI
+sur http://localhost:8000 (isolation de la toile, identification CLIP, guide RAG).
+
+Flux : l'utilisateur fournit une photo (onglet caméra ou import), l'API propose un
+recadrage de la toile, l'utilisateur le valide ou ajuste les 4 coins à la main, puis
+l'app lance l'identification et affiche l'œuvre trouvée avec ses métadonnées. Les
+images circulent avec l'API en base64 (pil_to_b64 / b64_to_pil).
+"""
 import os
 import io
 import base64
@@ -9,6 +22,14 @@ from streamlit_image_coordinates import streamlit_image_coordinates
 
 
 def _scroll_to_anchor(anchor_id: str):
+    """Fait défiler la page jusqu'à l'élément d'ancre donné après le rendu.
+
+    Injecte un petit script JS (via components.html) qui retrouve l'ancre dans la
+    page et la ramène en haut de vue. Le setTimeout de 30 ms laisse Streamlit finir
+    d'afficher les éléments avant le scroll. Sert à recentrer l'utilisateur sur le
+    résultat après une interaction (identification, validation du crop) sans qu'il
+    ait à faire défiler à la main.
+    """
     components.html(
         f"""<script>
         setTimeout(function() {{
@@ -28,12 +49,24 @@ st.caption("Prends une photo ou importe une photo d'un tableau pour l'identifier
 
 
 def pil_to_b64(image: Image.Image) -> str:
+    """Encode une image PIL en chaîne base64 JPEG pour l'envoi à l'API.
+
+    L'app parle à l'API en JSON, qui ne transporte pas de binaire : on sérialise
+    donc l'image en base64. Conversion en RGB imposée (retire un éventuel canal
+    alpha, incompatible JPEG). Encodage de transport uniquement, sans rapport avec
+    le preprocessing CLIP qui a lieu côté serveur dans artwork_core.
+    """
     buffer = io.BytesIO()
     image.convert("RGB").save(buffer, format="JPEG")
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
 def b64_to_pil(data_b64: str) -> Image.Image:
+    """Décode une chaîne base64 en image PIL (opération inverse de pil_to_b64).
+
+    Sert à reconstruire les images renvoyées par l'API (par exemple la toile isolée)
+    pour les afficher dans Streamlit.
+    """
     return Image.open(io.BytesIO(base64.b64decode(data_b64)))
 
 

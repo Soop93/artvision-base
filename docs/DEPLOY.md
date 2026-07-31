@@ -1,4 +1,4 @@
-# Déploiement Hugging Face — Récapitulatif (PoC8 → artvision-space)
+# Déploiement Hugging Face -> Récapitulatif (PoC8 → artvision-space)
 
 **Date :** 2026-07-28
 **Contexte :** bootcamp Jedha Lead Track IA — déploiement de PoC8 (reconnaissance d'œuvres + guide de musée).

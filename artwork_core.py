@@ -19,45 +19,19 @@ _CLIP_PREPROCESS = None
 _DEVICE = None
 
 
-#Chargement de CLIP en mémoire
 def _get_clip_model():
+    """Charge CLIP ViT-B/32 une seule fois et le réutilise (singleton).
+
+    Le modèle et son preprocess sont lourds : on les garde dans des variables
+    globales pour ne pas les recharger à chaque appel. Choisit le GPU si disponible,
+    sinon le CPU. Renvoie (modèle, preprocess, device). Même modèle et même
+    preprocess que la vectorisation de la base : c'est le contrat CLIP côté requête.
+    """
     global _CLIP_MODEL, _CLIP_PREPROCESS, _DEVICE
     if _CLIP_MODEL is None:
         _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
         _CLIP_MODEL, _CLIP_PREPROCESS = clip.load("ViT-B/32", device=_DEVICE)
     return _CLIP_MODEL, _CLIP_PREPROCESS, _DEVICE
-
-# =====================================================================================
-# OBJECTIF : à partir d'une photo de tableau (prise de biais,
-# avec cadre et fond), produire une image de la TOILE SEULE, redressée de face — le domaine
-# attendu par la base. Sans ça, CLIP encoderait le cadre/mur.
-#
-# DEUX MODÈLES, DEUX RÔLES (téléchargés au 1er lancement depuis Hugging Face) :
-#   - GroundingDINO (détection guidée par texte) : on lui donne le prompt "a painting", il
-#     renvoie une BOÎTE englobant le tableau. Il sait "où" mais grossièrement (rectangle).
-#   - SAM = Segment Anything Model (segmentation) : à partir d'un indice (un point ou une
-#     boîte), il renvoie un MASQUE précis de l'objet. Il sait "la forme exacte".
-#
-# PIPELINE `propose()` :
-#   1. GroundingDINO -> boîte autour du tableau.
-#   2. SAM avec un POINT au centre de la boîte -> masque de la toile.
-#      Si ce masque est trop petit (aire < area_thresh * aire boîte), c'est qu'on a attrapé un
-#      SOUS-objet (un visage, une zone) au lieu de la toile -> on bascule sur SAM avec la BOÎTE
-#      comme indice (englobe tout le tableau).
-#   3. masque -> quadrilatère à 4 coins (mask_to_quad).
-#   4. warp homographique (warp) -> toile redressée de face.
-#
-# Sortie : image couleur pleine résolution uint8 (BGR, cohérent OpenCV). AUCUN resize/
-# normalisation ici : le resize 224 + la normalisation restent la responsabilité de CLIP
-# (`preprocess`), pour rester cohérent avec la base.
-#
-# Côté web (Streamlit) :
-#   - `propose()` -> si le résultat est jugé insuffisant par l'utilisateur, il clique les 4
-#     coins sur l'image d'origine (composant `streamlit-image-coordinates`), puis `warp()` est
-#     rappelé directement avec ces 4 points (même fonction que celle utilisée en interne par
-#     `propose()`).
-# =====================================================================================
-
 
 def _models_cached(repo_ids):   # repo_ids : liste d'identifiants Hugging Face (e.g. IDEA-Research/grounding-dino-tiny)
     """True si tous les repos sont déjà dans le cache HF (aucun besoin réseau)."""
@@ -80,7 +54,7 @@ if os.environ.get("HF_HUB_OFFLINE") is None and _models_cached([GDINO_ID, SAM_ID
 
 # ---------- conversions PIL <-> BGR (l'app manipule du PIL, vs du BGR uint8) ----------
 def pil_to_bgr(pil_image: Image.Image) -> np.ndarray:
-    """PIL RGB -> ndarray BGR uint8 (format natif attendu par CanvasIsolator, cf. read_image_bgr)."""
+    """PIL RGB -> ndarray BGR uint8 (le format natif manipulé par CanvasIsolator / OpenCV)."""
     rgb = np.array(pil_image.convert("RGB"))
     return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
@@ -90,13 +64,53 @@ def bgr_to_pil(img_bgr: np.ndarray) -> Image.Image:
     return Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
 
 
-# modèles lourds à charger
-# charge une fois dans __init__, puis traite n images sans recharger
-# area-thresh - ratio aire(masque point)/aire(boîte) ->  fixé à 0.60, détection manuelle comme filet de sécurité.
-# Si incohérence lors de l'enrichissement de la database, tester [0.45, 0.50, 0.55]
 class CanvasIsolator:
+    """Isole la toile seule d'une photo de tableau, redressée de face.
+
+    OBJECTIF : à partir d'une photo de tableau (prise de biais, avec cadre et fond),
+    produire une image de la TOILE SEULE, redressée de face, le domaine attendu par
+    la base. Sans ça, CLIP encoderait aussi le cadre et le mur.
+
+    DEUX MODÈLES, DEUX RÔLES (téléchargés au 1er lancement depuis Hugging Face) :
+      - GroundingDINO (détection guidée par texte) : on lui donne un prompt TEXTE
+        ("a painting"), il renvoie une BOÎTE englobant le tableau. Il sait "où", mais
+        grossièrement (un rectangle).
+      - SAM (Segment Anything Model, segmentation) : on lui donne un prompt
+        GÉOMÉTRIQUE (un point ou une boîte), il renvoie un MASQUE précis de l'objet.
+        Il sait "la forme". SAM n'a pas de prompt texte.
+
+    PIPELINE propose() :
+      1. GroundingDINO donne une boîte autour du tableau.
+      2. SAM avec un POINT au centre de la boîte donne un masque de la toile. Si ce
+         masque est trop petit (aire < area_thresh x aire boîte), c'est qu'on a
+         attrapé un SOUS-objet (un visage, une zone) : on bascule sur SAM avec la
+         BOÎTE comme prompt (englobe tout le tableau).
+      3. masque converti en quadrilatère à 4 coins (mask_to_quad).
+      4. warp homographique (warp) pour obtenir la toile redressée de face.
+
+    Sortie : image couleur pleine résolution uint8 (BGR, cohérent OpenCV). AUCUN
+    resize ni normalisation ici : le resize 224 et la normalisation restent la
+    responsabilité de CLIP (preprocess), pour rester cohérent avec la base.
+
+    Côté web (Streamlit) : si l'utilisateur juge la proposition insuffisante, il
+    clique les 4 coins sur l'image d'origine (composant streamlit-image-coordinates),
+    puis warp() est rappelé avec ces 4 points (même géométrie qu'en interne).
+    """
+
     def __init__(self, prompt="a painting", area_thresh=0.60, device=None,
                  gdino_id=GDINO_ID, sam_id=SAM_ID, detect_max_side=1024):
+        """Charge GroundingDINO et SAM une seule fois ; l'instance traite ensuite n
+        images sans recharger (d'où l'usage en singleton, cf. _get_canvas_isolator).
+
+        Paramètres clés :
+          - prompt : requête texte donnée à GroundingDINO pour localiser le tableau.
+          - area_thresh : seuil du ratio aire(masque point)/aire(boîte) dans
+            propose(). Fixé à 0.60 ; en dessous, on considère que le point a attrapé
+            un sous-objet et on bascule sur la boîte. Filet de sécurité = clic
+            manuel. Si incohérence à l'enrichissement, tester [0.45, 0.50, 0.55].
+          - detect_max_side : côté max pour la détection/segmentation (accélère, cf.
+            _resize_for_detection) ; le warp final reste en pleine résolution.
+        """
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.prompt = prompt
         self.area_thresh = area_thresh
@@ -112,20 +126,16 @@ class CanvasIsolator:
     # ---------- géométrie ----------
     @staticmethod   # Fonction géométrique
     def order_points(pts):
-        """Range 4 points quelconques dans l'ordre TL, TR, BR, BL, à N'IMPORTE QUELLE rotation.
+        """Range 4 points quelconques dans l'ordre TL, TR, BR, BL, à n'importe quelle rotation.
 
-        === MODIF 2026-07-30 — fix crop manuel vide (tableau affiché en biais) ===
-        AVANT : astuce somme/différence (x+y min = TL / max = BR ; x−y min = TR / max = BL).
-                Elle DÉGÉNÈRE sur un quadrilatère tourné ~45° (losange) : deux coins partagent
-                la même somme ET la même différence -> un point assigné deux fois, un autre
-                oublié -> homographie effondrée -> `warpPerspective` recrache un aplat uni.
-        APRÈS : tri angulaire autour du centroïde, robuste à toute rotation (ci-dessous).
-        =========================================================================
-          - l'angle atan2 de chaque point autour du centre donne un ordre cyclique convexe
-            (polygone sans croisement), valable quelle que soit l'orientation ;
-          - on démarre au coin haut-gauche (somme x+y minimale) ; en repère image (y vers le bas),
-            atan2 croissant tourne dans le sens horaire -> on obtient TL, TR, BR, BL.
-        Marche quel que soit l'ordre des clics de l'utilisateur.
+        Méthode : tri angulaire (atan2) autour du centroïde donne un ordre cyclique convexe
+        valable quelle que soit l'orientation, puis départ au coin haut-gauche (x+y minimal).
+        En repère image (y vers le bas), atan2 croissant tourne dans le sens horaire, d'où
+        TL, TR, BR, BL. Marche quel que soit l'ordre des clics.
+
+        Remplace l'ancienne astuce somme/différence, qui dégénérait sur un losange à ~45°
+        (deux coins de même somme et même différence, un point compté deux fois, homographie
+        effondrée, crop vide). Fix du 2026-07-30.
         """
         pts = np.asarray(pts, dtype="float32")
         c = pts.mean(axis=0)                            # centroïde du quadrilatère
@@ -193,13 +203,15 @@ class CanvasIsolator:
 
     @staticmethod
     def _resize_for_detection(img_bgr, max_side):
-        """Réduit l'image avant détection/segmentation si elle dépasse max_side (le côté le plus
-        grand). GroundingDINO + SAM sont des transformers, leur coût grimpe vite avec la résolution
-        d'entrée -> sur une photo de smartphone (souvent 3000-4000px), l'inférence peut prendre
-        plusieurs dizaines de secondes sur CPU pour rien, la précision utile plafonne bien avant.
-        Renvoie (image_redimensionnée, scale) ; scale=1.0 si l'image est déjà assez petite.
-        Le warp final se fait toujours sur l'image ORIGINALE (cf. propose()) : ce resize n'affecte
-        que la vitesse de détection, jamais la qualité de la toile isolée."""
+        """Réduit l'image avant détection/segmentation si son plus grand côté dépasse max_side.
+
+        - Pourquoi : GroundingDINO + SAM sont des transformers ; leur coût (temps, VRAM)
+          grimpe vite avec la résolution. Une photo 3000-4000px alourdit l'inférence pour
+          rien, la précision utile plafonne avant.
+        - Retour : (image_redimensionnée, scale) ; scale=1.0 si déjà assez petite.
+        - Garantie : le warp final reste sur l'image ORIGINALE (cf. propose()), donc ce
+          resize n'affecte que la vitesse, jamais la qualité de la toile.
+        """
         h, w = img_bgr.shape[:2]
         scale = min(1.0, max_side / max(h, w))
         if scale >= 1.0:
@@ -209,7 +221,10 @@ class CanvasIsolator:
 
     # ---------- détection / segmentation ----------  Utilisation des modèles
     def detect_box(self, img_bgr, box_thr=0.25, text_thr=0.25):
-        """GroundingDINO -> meilleure boîte [x0,y0,x1,y1] (px) ou None.
+        """GroundingDINO : renvoie la meilleure boîte [x0,y0,x1,y1] en pixels, ou None.
+
+        Applique le prompt texte, filtre par les seuils box/text, et garde la boîte de
+        plus haut score. None si rien ne passe les seuils (déclenche le repli manuel).
         doc : https://huggingface.co/docs/transformers/v5.14.0/en/model_doc/grounding-dino#transformers.GroundingDinoImageProcessor
         """
         rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
@@ -225,12 +240,12 @@ class CanvasIsolator:
         return [int(v) for v in res["boxes"][best].tolist()]
 
     def _sam_mask(self, img_bgr, points=None, boxes=None):
-        """Lance SAM avec un indice (point OU boîte) et renvoie le meilleur masque booléen.
+        """Lance SAM avec un prompt géométrique (point OU boîte) et renvoie le meilleur masque booléen.
         Docs : https://huggingface.co/docs/transformers/tasks/mask_generation
                https://huggingface.co/docs/transformers/model_doc/sam
 
-        SAM propose 3 masques candidats par indice (avec un score IoU estimé chacun) ; on garde
-        celui de meilleur score. `points` et `boxes` sont les deux modes d'invite utilisés par propose().
+        SAM propose 3 masques candidats par prompt (avec un score IoU estimé chacun) ; on garde
+        celui de meilleur score. `points` et `boxes` sont les deux modes de prompt utilisés par propose().
         """
         rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         inputs = self.sproc(rgb, input_points=points, input_boxes=boxes,
@@ -244,12 +259,20 @@ class CanvasIsolator:
         return masks[0][0][int(iou.argmax())].numpy().astype(bool)   # le meilleur des 3 candidats :
 
     def sam_point_to_quad(self, img_bgr, pt):
+        """SAM en mode POINT : segmente autour du point `pt`, nettoie le masque, en tire
+        un quadrilatère. Renvoie (quad, mask_bin) ; mask_bin sert au calcul de l'aire
+        dans propose() pour décider si on bascule sur le mode boîte.
+        """
         mask = self._sam_mask(img_bgr, points=[[[int(pt[0]), int(pt[1])]]])  # Appelle le mode point de SAM
                                                                             # [[[..]]] -> (batch image = 1, objets = 1, points de l'objet = (x,y)
         mask_bin = self.clean_mask(mask)
         return self.mask_to_quad(mask_bin), mask_bin   # renvoit tuple (quad, mask_bin), mask_bin nécessaire au calcul de l'aire dans propose()
 
     def sam_box_to_quad(self, img_bgr, box):
+        """SAM en mode BOÎTE : segmente dans la boîte `box`, nettoie le masque, en tire un
+        quadrilatère. Voie de secours de propose() quand le mode point n'a attrapé qu'un
+        sous-objet ; la boîte force SAM à englober tout le tableau. Renvoie (quad, mask_bin).
+        """
         mask = self._sam_mask(img_bgr, boxes=[[box]])  # Mode Boxes de SAM
         mask_bin = self.clean_mask(mask)
         return self.mask_to_quad(mask_bin), mask_bin
@@ -284,9 +307,9 @@ class CanvasIsolator:
     # ---------- validation manuelle (équivalent web de click_corners / show_and_decide) ----------
     def warp_from_points(self, img_bgr, points):
         """Redresse la toile à partir de 4 points cliqués par l'utilisateur (ordre libre, coords
-        pleine résolution de l'image d'origine). C'est le pendant web du mode 'c = cliquer les 4
-        coins' du script CLI de mon collègue : même géométrie (order_points + warp), seule la
-        capture des clics change (composant Streamlit au lieu d'une fenêtre OpenCV)."""
+        pleine résolution de l'image d'origine). Pendant web du mode 'cliquer les 4 coins' :
+        même géométrie que l'auto (order_points + warp), seule la capture des clics change
+        (composant Streamlit au lieu d'une fenêtre OpenCV)."""
         quad = np.array(points, dtype="float32")
         return self.warp(img_bgr, quad)
 
@@ -296,16 +319,23 @@ _CANVAS_ISOLATOR = None
 
 
 def _get_canvas_isolator():
+    """Charge le CanvasIsolator (GroundingDINO + SAM) une seule fois et le réutilise
+    (singleton, même logique que _get_clip_model). Évite de recharger ces modèles
+    lourds à chaque requête.
+    """
     global _CANVAS_ISOLATOR
     if _CANVAS_ISOLATOR is None:
         _CANVAS_ISOLATOR = CanvasIsolator()
     return _CANVAS_ISOLATOR
 
-#Proposition automatique de découpe de la toile (remplace crop_to_salient_region/U2Net) :
-#GroundingDINO détecte le tableau, SAM segmente la toile, puis redressement homographique.
-#Renvoie (image_pil_ou_None, tag) — tag = trace de la voie prise ("point 87%", "no-box"...),
-#utile à afficher côté Streamlit pour informer l'utilisateur / lui proposer le clic manuel.
 def propose_canvas(pil_image: Image.Image):
+    """Point d'entrée API de la découpe automatique. Prend l'image PIL reçue, la
+    convertit en BGR, lance CanvasIsolator.propose(), et renvoie (toile_pil, tag) ou
+    (None, tag) en cas d'échec.
+
+    Le tag trace la voie prise ("point 87%", "no-box"...) : Streamlit s'en sert pour
+    informer l'utilisateur ou lui proposer le clic manuel.
+    """
     isolator = _get_canvas_isolator()
     img_bgr = pil_to_bgr(pil_image)
     toile_bgr, tag = isolator.propose(img_bgr)
@@ -314,18 +344,26 @@ def propose_canvas(pil_image: Image.Image):
     return bgr_to_pil(toile_bgr), tag
 
 
-#Découpe manuelle : l'utilisateur a cliqué les 4 coins de la toile dans Streamlit (coords pleine
-#résolution de l'image d'origine). On applique le même redressement homographique que propose().
 def manual_canvas(pil_image: Image.Image, points):
+    """Point d'entrée API de la découpe manuelle. L'utilisateur a cliqué les 4 coins
+    de la toile dans Streamlit (coords pleine résolution de l'image d'origine) ; on
+    applique le même redressement homographique que propose() (warp_from_points).
+    Renvoie la toile isolée en PIL.
+    """
     isolator = _get_canvas_isolator()
     img_bgr = pil_to_bgr(pil_image)
     toile_bgr = isolator.warp_from_points(img_bgr, points)
     return bgr_to_pil(toile_bgr)
 
 
-#Embedding CLIP d'une image déjà isolée/redressée (toile seule). La découpe (auto ou manuelle)
-#est désormais une étape à part, validée par l'utilisateur avant d'arriver ici.
 def embed_image(cropped_image: Image.Image):
+    """Calcule l'embedding CLIP d'une toile déjà isolée et redressée.
+
+    La découpe (auto ou manuelle) est une étape séparée, validée par l'utilisateur
+    avant d'arriver ici. Applique le preprocess CLIP puis encode_image, et renvoie le
+    vecteur en liste Python. Même modèle et même preprocess que la vectorisation de la
+    base : c'est ce qui garantit la comparabilité des distances (contrat CLIP).
+    """
     model, preprocess, device = _get_clip_model()
     tensor = preprocess(cropped_image).unsqueeze(0).to(device)
     with torch.no_grad():
@@ -333,11 +371,18 @@ def embed_image(cropped_image: Image.Image):
     return features.cpu().numpy().tolist()[0]
 
 
-#Fonction appelée depuis l'API une fois la toile isolée et validée (auto ou clic manuel) :
-#embedding CLIP + recherche de similarité par défaut de ChromaDB
-#Piste (cf. README) : renvoyer un top-k + distances, avec seuil de confiance et écart 1er/2e
-#candidat, pour signaler les cas ambigus au lieu de trancher au top-1.
 def search_artwork(cropped_image: Image.Image):
+    """Identifie l'œuvre à partir de la toile isolée et validée.
+
+    Chaîne : embedding CLIP (embed_image), puis plus proche voisin dans ChromaDB
+    (métrique L2 par défaut), puis lecture des métadonnées complètes dans la base
+    SQLite harvard_clean via l'artwork_id, assemblées en dict pour l'affichage
+    Streamlit (avec image_path vers images_clean).
+
+    Piste (cf. README) : renvoyer un top-k avec distances, un seuil de confiance et
+    l'écart 1er/2e candidat, pour signaler les cas ambigus au lieu de trancher
+    systématiquement au top-1.
+    """
     embedding = embed_image(cropped_image)
 
     client = chromadb.PersistentClient(path=VECTOR_STORE_PATH)

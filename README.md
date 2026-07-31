@@ -8,7 +8,7 @@ app_port: 7860
 pinned: false
 ---
 
-# ArtVision — reconnaissance d'œuvres d'art + guide de musée
+# ArtVision : reconnaissance d'œuvres d'art + guide de musée
 
 Projet de fin de module du bootcamp Jedha – Lead Track IA, réalisé en trinôme. On prend une
 photo d'un tableau : l'application isole la toile, l'identifie dans la collection du Harvard

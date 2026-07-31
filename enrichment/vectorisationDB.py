@@ -1,3 +1,26 @@
+"""Vectorisation CLIP de la base et indexation dans ChromaDB.
+
+Dernière étape de la chaîne d'enrichissement (extractAPI puis augmentDB puis
+vectorisationDB). Lit chaque variante de `artwork_variants`, calcule son embedding
+CLIP ViT-B/32 et l'upsert dans la collection Chroma `artworks_collection`
+(stockée dans `vector_store_images/`).
+
+Ce que représente le contrat index/requête : l'identification compare la photo de
+l'utilisateur aux œuvres de la base par distance entre vecteurs. Pour que cette
+distance ait un sens, les deux côtés (la base indexée ici, la requête calculée dans
+artwork_core.embed_image) doivent produire leurs vecteurs de façon rigoureusement
+identique : même modèle CLIP, même preprocessing, même absence de normalisation,
+même métrique. Si un seul de ces éléments diffère, les vecteurs vivent dans deux
+espaces incompatibles et la comparaison devient fausse sans lever la moindre erreur,
+d'où l'insistance à ne rien changer sur un seul côté.
+
+Concrètement, le contrat fixé ici : embeddings CLIP bruts (aucune normalisation L2)
+et métrique L2 par défaut de Chroma. La requête fait exactement pareil. Passer en
+cosinus (avec normalisation L2 des deux côtés) est une piste d'amélioration
+documentée dans le README, pas un correctif à appliquer d'un seul côté.
+
+Incrémental : saute les variant_id déjà présents dans la collection.
+"""
 import chromadb
 import torch
 import clip

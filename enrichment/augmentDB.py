@@ -23,10 +23,15 @@ DEGRADATION_PIPELINE = A.Compose([
     A.GaussNoise(std_range=(0.02, 0.08), p=0.5),
 ], seed=SEED)
 
-#Recadrage aléatoire 75-95 % : simule une photo cadrée un peu large ou un peu serrée sur la
-#toile. Choix de robustesse ; à l'inférence la toile est isolée entière et redressée, donc on
-#reste proche du domaine tant que le crop ne coupe pas le motif central.
 def random_crop(image, min_ratio=0.75, max_ratio=0.95):
+    """Recadrage aléatoire à 75-95 % de l'image, utilisé pour l'augmentation.
+
+    Introduit une invariance au cadrage dans les embeddings de base : chaque œuvre
+    est représentée par plusieurs rendus légèrement recadrés, si bien que la
+    recherche ne dépend pas d'un cadrage unique. Plancher à 75 % pour ne pas amputer
+    le motif central (l'œuvre resterait reconnaissable mais s'éloignerait du domaine).
+    `image` = array (H, W, 3) ; renvoie la sous-image recadrée.
+    """
     h, w = image.shape[:2]
     ratio = random.uniform(min_ratio, max_ratio)
     new_h, new_w = int(h * ratio), int(w * ratio)
@@ -36,6 +41,20 @@ def random_crop(image, min_ratio=0.75, max_ratio=0.95):
 
 
 def main():
+    """Construit la table `artwork_variants` : pour chaque œuvre de `artworks`,
+    insère la ligne 'original' + N clones augmentés (`N_CLONES_PER_ARTWORK`) écrits
+    dans `images_augmented/`.
+
+    But de l'augmentation : densifier l'espace CLIP autour de chaque œuvre avec des
+    rendus plausibles (`random_crop` + `DEGRADATION_PIPELINE` : flou, contraste,
+    perspective, compression, bruit) pour que la recherche soit robuste à la
+    variabilité des photos-requête et pas pour corriger de mauvaises photos. Chaque
+    œuvre finit ainsi avec plusieurs vecteurs, ce qui améliore le rappel top-k.
+    Incrémental : saute un clone si sa ligne BDD ET son fichier existent déjà.
+    `random.seed(SEED)` rend l'aléa reproductible (mêmes clones → mêmes embeddings).
+    Travail en RGB en interne (cohérent CLIP/PIL), retour BGR juste avant
+    `cv2.imwrite`.
+    """
     random.seed(SEED)   # contrôle l'aléa de random_crop (random.uniform/randint)
 
     os.makedirs(AUG_DIR, exist_ok=True)
